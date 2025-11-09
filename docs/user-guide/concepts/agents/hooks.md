@@ -359,3 +359,120 @@ agent("Sleep 5 times for 10ms each or until you can't anymore")
 # This will sleep successfully again because the count resets every invocation
 agent("Sleep once")
 ```
+
+### Limit LLM Calls
+
+Useful for preventing infinite loops, controlling costs, and ensuring predictable response times. This hook tracks the number of model calls per agent invocation and stops execution when the limit is reached.
+
+```python
+from strands.hooks import HookRegistry, HookProvider, BeforeModelCallEvent, BeforeInvocationEvent
+from strands.exceptions import StrandsException
+from threading import Lock
+
+class LimitLLMCalls(HookProvider):
+    """Limits the maximum number of LLM calls per agent invocation"""
+    
+    def __init__(self, max_calls: int, error_message: str = None):
+        """
+        Initialize the LLM call limiter.
+
+        Args:
+            max_calls: Maximum number of LLM calls allowed per invocation
+            error_message: Custom message to return when limit is exceeded. 
+                          If None, raises an exception instead.
+        """
+        self.max_calls = max_calls
+        self.error_message = error_message or f"Maximum LLM calls ({max_calls}) exceeded"
+        self.call_count = 0
+        self._lock = Lock()
+
+    def register_hooks(self, registry: HookRegistry) -> None:
+        registry.add_callback(BeforeInvocationEvent, self.reset_count)
+        registry.add_callback(BeforeModelCallEvent, self.check_limit)
+
+    def reset_count(self, event: BeforeInvocationEvent) -> None:
+        """Reset call count at the start of each invocation"""
+        with self._lock:
+            self.call_count = 0
+
+    def check_limit(self, event: BeforeModelCallEvent) -> None:
+        """Check if we've exceeded the LLM call limit"""
+        with self._lock:
+            self.call_count += 1
+            
+        if self.call_count > self.max_calls:
+            # Raise exception to stop execution
+            raise StrandsException(self.error_message)
+```
+
+Example usage to limit an agent to 3 LLM calls:
+
+```python
+from strands import Agent, tool
+
+@tool
+def calculator(expression: str) -> str:
+    """Evaluate a mathematical expression"""
+    try:
+        result = eval(expression)
+        return f"The result is: {result}"
+    except Exception as e:
+        return f"Error: {e}"
+
+# Create hook to limit LLM calls
+llm_limiter = LimitLLMCalls(
+    max_calls=3,
+    error_message="Agent stopped: Maximum of 3 LLM calls reached to prevent infinite loops"
+)
+
+agent = Agent(tools=[calculator], hooks=[llm_limiter])
+
+try:
+    # This might hit the limit if the agent makes multiple calls
+    result = agent("Calculate 2+2, then 3+3, then 4+4, then keep calculating more numbers")
+    print(result)
+except Exception as e:
+    print(f"Execution stopped: {e}")
+```
+
+For cases where you want to return a graceful response instead of raising an exception:
+
+```python
+class GracefulLLMLimit(HookProvider):
+    """Gracefully handle LLM call limits by returning a predefined message"""
+    
+    def __init__(self, max_calls: int, fallback_message: str = "Response limit reached"):
+        self.max_calls = max_calls
+        self.fallback_message = fallback_message
+        self.call_count = 0
+        self.limit_reached = False
+        self._lock = Lock()
+
+    def register_hooks(self, registry: HookRegistry) -> None:
+        registry.add_callback(BeforeInvocationEvent, self.reset_state)
+        registry.add_callback(BeforeModelCallEvent, self.check_limit)
+
+    def reset_state(self, event: BeforeInvocationEvent) -> None:
+        with self._lock:
+            self.call_count = 0
+            self.limit_reached = False
+
+    def check_limit(self, event: BeforeModelCallEvent) -> None:
+        with self._lock:
+            self.call_count += 1
+            
+        if self.call_count > self.max_calls:
+            self.limit_reached = True
+            # Modify the model call to return our fallback message
+            # This prevents the actual LLM call from happening
+            raise StrandsException(self.fallback_message)
+
+# Usage with graceful handling
+graceful_limiter = GracefulLLMLimit(
+    max_calls=2, 
+    fallback_message="I've reached my processing limit for this request. Please try a simpler query."
+)
+
+agent = Agent(tools=[calculator], hooks=[graceful_limiter])
+result = agent("Do many calculations")
+```
